@@ -1,0 +1,142 @@
+---
+title: "Causal Impact Helper Example"
+output:
+  pdf_document: default
+  html_document: default
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(CausalImpact)
+require(CausalImpactHelper)
+require(knitr)
+require(tidyverse)
+require(plotly)
+options(scipen = 20)
+
+data("registration_data")
+set.seed(1)
+
+```
+
+# Dataset Case
+
+This example goes through the `registration_data` dataset included in the `CausalImpactHelper` package. The dataset is made of daily sampled observations from a mobile platform, with two series: `New_Users` and `Registered_Users`. There was a product intervention at the 81st observation aimed at increasing the rate of registered users on the platform.
+
+```{r}
+head(registration_data)
+```
+
+# Causal Impact Analysis: Full Period
+
+## A/A Test
+
+The first step of validating the approach is to run an A/A test. Using the pre-period data we should be able to run a CausalImpact (CI) analysis and not detect any changes. If changes are detected, it is indicative that the relationships between the treatment and control series are not stable during the pre-period, in which case they would be unsuitable to generate post-period predictions.
+
+In this example we see that with the more likely `prior.level.sd` value of `0.01` (as opposed to `0.1`), a significant change is detected in the pre-period.
+
+```{r}
+causalimpact_data = registration_data %>%
+  dplyr::select(Registered_Users, New_Users)
+
+pre_period = c(1, 80)
+post_period = c(81, 105)
+aa_args = list(niter = 1000, nseasons = 7, prior.level.sd = 0.01)
+
+ci_model = RunAATest(causalimpact_data, pre_period, aa_args)
+plot(ci_model$aa_causalimpact_model)
+```
+
+## Time Series Inspection
+
+Assessing the time series being used can help us determine if or where problems might be occurring.
+
+Several assessments are made through the `RunCointegrationTest` method:
+
+ - Stationarity of the treatment series in the pre-period. If the treatment series is stationary, we should expect CI to be a suitable methodology (this is not a requirement though).
+ - Stationarity of the control series in the pre-period. If the control series are stationary, we should expect CI to be a suitable methodology (this is not a requirement though).
+ - Cointegration of the treatment and control series in the pre-period. Residual stationarity indicates a legitimate cointegration relationship between the noted control series and the treatment. This indicates that the control series should be a suitable choice for CI. Non-stationary residuals suggests that there is an unstable relationship with the treatment during the pre-period, in which case the control may not be suitable or CI might not be feasible (if there aren't other suitable control series which could be used instead).
+ 
+In this case, we see the control and treatment series are both non-stationary, which is just informative. However, the cointegration between the two is also non-stationary, indicating that the pre-period data isn't suitable to the post-period forecasting. This explains the false intervention detected in the A/A test.
+
+```{r}
+cointegration_test = RunCointegrationTest(causalimpact_data, pre_period, "Registered_Users", run_stationarity_on_controls = T)
+kable(cointegration_test$test_results)
+```
+
+Visually inspecting the cointegration residuals may provide some insight into the dynamics occurring (though there is no guarantee of this).
+
+In this case, we can see a structural change occur around the 20th observation, where there was a trend in previous residuals, but residuals after the 20th point look like they could be stationary. Notably, this can also be seen in the CausalImpact plots above.
+
+```{r}
+subplot(cointegration_test$cointegration_residual_graphs)
+```
+
+# Causal Impact Analysis: Reduced Period
+
+## A/A Tests
+
+Using the information above, we can remove some of the pre-period data from our analysis. Truncating the beginning of the pre-period and repeating the A/A test, we get a better result, with a lower indication of any intervention. The 95% CI bounds provide an rough estimate of the effect size we might need to have from the intervention in order to have a conclusive detection.
+
+```{r}
+pre_period = c(21, 80)
+post_period = c(81, 105)
+aa_args = list(niter = 1000, nseasons = 7, prior.level.sd = 0.01)
+
+ci_model = RunAATest(causalimpact_data, pre_period, aa_args)
+plot(ci_model$aa_causalimpact_model)
+```
+
+We can inspect the cointegration series again to further assess if we have made a constructive adjustment. Here we see that there may still be some autocorrelation present in the cointegration residuals, however this is not necessarily indicative of non-stationarity (there may be constant autocorrelation due to trends or seasonality which CI will account for). All other results indicate stationarity, which is sufficient to continue with the analysis.
+
+```{r}
+cointegration_test = RunCointegrationTest(causalimpact_data, pre_period, "Registered_Users", run_stationarity_on_controls = F)
+kable(cointegration_test$test_results)
+```
+
+## Actual Pre Post Assessment
+
+Here we run the actual CI analysis, with our reduced pre_period, and more MCMC iterations (indicated by `niter`) so as to help narrow the credible interval if possible.
+
+```{r}
+pre_period = c(21, 80)
+post_period = c(81, 105)
+
+impact = CausalImpact(as.matrix(causalimpact_data), pre_period, post_period, model.args = list(niter = 10000, nseasons = 7, prior.level.sd = 0.01))
+summary(impact)
+plot(impact)
+```
+
+The analysis yields strong results, with a 97% probability of a causal effect from the intervention. The credible interval for the intervention is [-0.38%, 20%], with a 9.7% midpoint (the 95% CI indicates that this interval is generated from the central 95% of prediction iterations).
+
+## Further Analysis
+
+While the above is sufficient for reporting, we may wish to dig a little deeper into our CI results.
+
+The first graph shows the inclusion likelihood of our control series in one of the final posterior models. In this case we only have 1 control series with 100% probability, though in a more sophisticated example this may provide an indication of how much value the different control series are providing.
+
+```{r, warning = F}
+parameter_summary = GenerateParameterSummary(impact)
+```
+
+The statistics below offer some further insight regarding the final models:
+
+ - Regression Coefficients: similarly to above, this may offer some insight into the impact of different series (assuming there is no multicollinearity).
+ - Noise Observation Standard Deviation: This provides some insight into the degree of unexplained noise in the posterior models.
+ - Local Level Standard Deviation: Should converge to the `prior.level.sd` parameter.
+
+
+```{r}
+kable(parameter_summary$statistics_dataframe)
+```
+
+The state contributions graph shows a summary of which components in the BSTS models contributed to the final states. This provides some insight into how much of the posterior predictions were based on trends, seasonality and the control regression series.
+
+In this case, it's clear the model is primarily based off of the control series, with some additional input provided by seasonality.
+
+```{r}
+(parameter_summary$state_contributions_plot)
+```
+
